@@ -5,7 +5,7 @@
 	"license": "Apache-2.0",
 	"type": "module",
 	"scripts": {
-		"check": "tsc",
+		"check": "wrangler types && tsc",
 		"test": "vitest run && node --test \"scripts/**/*.test.mjs\"",
 		"dev": "wrangler dev",
 		"types": "wrangler types",
