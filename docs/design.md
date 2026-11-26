@@ -169,7 +169,7 @@ in full by `memory_context`.
 |---|---|---|---|
 | `memory_context` | none | `notes`: every `profile/` and `preferences/` note in full; then `catalog` (path, title, summary of every other note) or, when that would not fit, `folders` with note counts. Capped at 8,000 characters. `not_included` lists a pinned note too large for the cap. | index |
 | `memory_search` | `query`, optional `folder`, `limit` (default 10) | `results`: ranked `path`, `title`, `snippet` | index |
-| `memory_read` | `path`, optional `ref` (commit) | `text`, `version` (blob SHA), `updated_at`, `author` | binding `readFile` |
+| `memory_read` | `path`, optional `ref` (commit) | `text`, `version` (blob SHA), `updated_at`, `author` (both null when not known) | binding `readFile`; `updated_at` and `author` from MemoryStore SQLite |
 | `memory_list` | optional `folder` | `notes` (at most 500) and `truncated` | index |
 | `memory_history` | `path`, optional `limit` | commits: SHA, date, author, message | binding `log` |
 | `memory_write` | `path`, `text`, `base_version` (absent means "must be new"), optional `message`, `force` | new `version` and commit SHA; or `conflict`, `duplicates`, `refused`, `retryable` | MemoryStore |
@@ -217,6 +217,15 @@ stored; every write token is minted on demand and expires in 5 minutes.
 `memory_read` and `memory_history` call the binding from the Worker, not the Durable
 Object, so reads never wait behind a write. Reads retry once, after 250 ms, on a
 non-JSON or 5xx response.
+
+`memory_read` reports when the note last changed and which client changed it. The head
+commit of `main` cannot say: it belongs to whichever note changed last. So a read of
+`main` asks the Durable Object for the note's index row, at the same time as it reads
+the text. That query runs outside the write queue, so the read still does not wait
+behind a write. The row counts only when its blob SHA equals the version just read;
+otherwise the index is a push behind and both fields are null. The fields are also null
+when the index cannot be asked. A read that names a `ref` reports that commit's own
+author and date, which is right for the commits `memory_history` lists.
 
 ### Index maintenance
 
