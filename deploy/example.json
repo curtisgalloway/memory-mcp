@@ -1,0 +1,9 @@
+{
+	"workerName": "memory-mcp",
+	"mcpResource": "https://memory-mcp.REPLACE-WITH-YOUR-WORKERS-SUBDOMAIN.workers.dev/mcp",
+	"artifactsNamespace": "memory",
+	"memoryRepo": "memory",
+	"kvNamespaceId": "REPLACE-WITH-THE-32-CHARACTER-KV-NAMESPACE-ID",
+	"allowedGithubId": "REPLACE-WITH-YOUR-NUMERIC-GITHUB-ACCOUNT-ID",
+	"githubClientId": "REPLACE-WITH-THE-GITHUB-OAUTH-APP-CLIENT-ID"
+}

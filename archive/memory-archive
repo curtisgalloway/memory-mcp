@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Curtis Galloway
+# SPDX-License-Identifier: Apache-2.0
+"""Keep a full local copy of the memory-mcp notes repo up to date. One run.
+
+Meant to be installed as /usr/local/bin/memory-archive and started every 15
+minutes by memory-archive.timer. Setup and runbook: README.md beside this file.
+
+What a run does:
+  1. Reads the repo's remote URL (MEMORY_ARCHIVE_REMOTE) and its read-only
+     repo token: from MEMORY_ARCHIVE_TOKEN, or from the file systemd hands
+     the job ($CREDENTIALS_DIRECTORY/memory-archive-token, memory-backed).
+  2. Fetches the repo into $MEMORY_ARCHIVE_ROOT/<repo name>/ and moves `main`
+     forward, by fast-forward only.
+  3. Saves what it knows (last success, token expiry, head commit time) in
+     its own state file and, if MEMORY_ARCHIVE_METRICS is set, rewrites that
+     Prometheus textfile from it, on success and on failure.
+
+The token is never written anywhere or put on any command line. It reaches
+git only in the environment of the one `git fetch` process, as an
+Authorization header set through GIT_CONFIG_* variables: not in .git/config,
+not in the remote URL, not through a credential helper. Nothing this program
+prints contains the token or the remote URL.
+
+The whole run works against one deadline, shorter than the unit's
+TimeoutStartSec, so a slow step ends as a recorded failure and not as a job
+killed before it could say what happened.
+
+Standard library only. Exit status: 0 the archive is current, 1 the run
+failed (the journal line names the step), 2 the program was started without
+the settings it needs.
+"""
+
+import argparse
+import errno
+import json
+import math
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+DEFAULT_ROOT = "/var/lib/memory-archive"
+# Name of the credential the unit loads (LoadCredential= in the service).
+TOKEN_CREDENTIAL = "memory-archive-token"
+# The unit's TimeoutStartSec is 300 s. Every step takes its time from this
+# one budget. A step that cannot be bounded from inside (a name lookup that
+# hangs) is ended by the backstop, a watchdog that fires one grace period
+# after the budget, records the failure and exits: 240 s + 30 s = 270 s, 30 s
+# before systemd would kill the job with nothing recorded.
+DEFAULT_DEADLINE_SECONDS = 240
+BACKSTOP_GRACE_FRACTION = 8  # grace = budget / 8, and never under 5 s
+BACKSTOP_GRACE_MINIMUM = 5
+GIT_STEP_SECONDS = 30
+FETCH_STEP_SECONDS = 180
+
+REPO_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+EXPIRES = re.compile(r"\?expires=([0-9]{9,12})$")
+# A leading dot cannot be a repo name, so this never collides with a clone.
+STATE_DIR = ".state"
+STATE_FILE = "state.json"
+
+# (metric name, key in the state, help text)
+METRICS = (
+    (
+        "memory_archive_last_run_timestamp_seconds",
+        "last_run",
+        "Unix time the archive job last ran.",
+    ),
+    (
+        "memory_archive_last_run_ok",
+        "last_run_ok",
+        "1 if the last run left the archive current, 0 if it failed.",
+    ),
+    (
+        "memory_archive_last_success_timestamp_seconds",
+        "last_success",
+        "Unix time the archive was last confirmed current. 0 if never.",
+    ),
+    (
+        "memory_archive_token_expiry_timestamp_seconds",
+        "token_expiry",
+        "Unix time the repo token expires, read from the token itself.",
+    ),
+    (
+        "memory_archive_head_commit_timestamp_seconds",
+        "head_commit_time",
+        "Commit time of the archived main branch.",
+    ),
+)
+KEPT = ("last_success", "token_expiry", "head_commit_time")
+
+HELP_EPILOG = """\
+Environment:
+  MEMORY_ARCHIVE_REMOTE            required. https URL of the notes repo, with
+                                   no user name or password in it.
+  MEMORY_ARCHIVE_TOKEN             the read-only repo token, ending in
+                                   ?expires=<unix time>. Optional when systemd
+                                   supplies the token as a credential (below).
+  CREDENTIALS_DIRECTORY            set by systemd (LoadCredential=). The token
+                                   is read from the file memory-archive-token
+                                   in it when MEMORY_ARCHIVE_TOKEN is not set.
+  MEMORY_ARCHIVE_ROOT              state directory holding the clone and the
+                                   saved state. Default: /var/lib/memory-archive
+  MEMORY_ARCHIVE_METRICS           path of a Prometheus textfile to write. No
+                                   metrics are written when it is not set.
+  MEMORY_ARCHIVE_GIT               the git program to run. Default: git
+  MEMORY_ARCHIVE_DEADLINE_SECONDS  time budget for the whole run, in seconds
+                                   above zero. Default: 240
+
+Exit status: 0 the archive is current, 1 the run failed, 2 not configured.
+"""
+
+
+class Failure(Exception):
+    """A run that could not finish. `step` names where; neither holds a secret."""
+
+    def __init__(self, step, message):
+        super().__init__(message)
+        self.step = step
+        self.message = message
+
+
+def why(err):
+    """A short reason for an OSError, never the word None."""
+    return err.strerror or str(err) or type(err).__name__
+
+
+class Deadline:
+    """One time budget for the whole run."""
+
+    def __init__(self, seconds):
+        self.end = time.monotonic() + seconds
+
+    def allow(self, step, cap):
+        """Seconds this step may take: its cap, or what is left if less."""
+        left = self.end - time.monotonic()
+        if left <= 0:
+            raise Failure(step, "the run is out of time")
+        return min(cap, left)
+
+
+def parse_expiry(token):
+    """Return the Unix expiry a repo token carries, or None if it has none."""
+    match = EXPIRES.search(token)
+    return int(match.group(1)) if match else None
+
+
+def check_remote(remote):
+    """Return the repo name for an acceptable remote URL, or raise Failure.
+
+    Acceptable means https, no user or password in it, and a last path part
+    that is a plain name. The name becomes a directory, so it is matched
+    against a strict pattern, never used as given.
+    """
+    if not remote.startswith("https://"):
+        raise Failure("remote", "the remote is not an https URL")
+    rest = remote[len("https://") :]
+    host = rest.split("/", 1)[0]
+    if "@" in host or not host:
+        raise Failure("remote", "the remote URL carries a user or password")
+    if any(c.isspace() for c in remote) or "?" in remote or "#" in remote:
+        raise Failure("remote", "the remote URL is malformed")
+    name = rest.rstrip("/").rsplit("/", 1)[-1]
+    if name.endswith(".git"):
+        name = name[: -len(".git")]
+    if "/" not in rest or not REPO_NAME.match(name):
+        raise Failure("remote", "the remote URL does not end in a repo name")
+    return name
+
+
+def scrub(text, secrets):
+    """Remove every secret from text and keep it to one short line."""
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "<hidden>")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return (lines[-1] if lines else "")[:300]
+
+
+def read_token(environ):
+    """Return the repo token: from the environment, else systemd's credential."""
+    if "MEMORY_ARCHIVE_TOKEN" in environ:
+        token = environ["MEMORY_ARCHIVE_TOKEN"].strip()
+    else:
+        path = os.path.join(environ["CREDENTIALS_DIRECTORY"], TOKEN_CREDENTIAL)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                token = handle.read().strip()
+        except (OSError, ValueError) as err:
+            raise Failure("token", "no token: %s" % why_any(err)) from None
+    if not token or any(c.isspace() for c in token):
+        raise Failure("token", "the token is empty or malformed")
+    return token
+
+
+def why_any(err):
+    """A short reason for an error that may not be an OSError."""
+    if isinstance(err, OSError):
+        return why(err)
+    return type(err).__name__
+
+
+# --- git ---------------------------------------------------------------------
+
+
+def base_env():
+    env = {
+        "PATH": os.environ.get("PATH", DEFAULT_PATH),
+        "LANG": "C",
+        "LC_ALL": "C",
+    }
+    if "HOME" in os.environ:
+        env["HOME"] = os.environ["HOME"]
+    return env
+
+
+# git processes now running, for the backstop to kill.
+RUNNING = []
+
+
+def kill_group(process):
+    """Kill a git and everything it started (it has its own process group)."""
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except OSError:
+        process.kill()
+
+
+class Git:
+    """Runs git with no system or user configuration and no prompts."""
+
+    def __init__(self, program, secrets, deadline):
+        self.program = program
+        self.secrets = secrets
+        self.deadline = deadline
+
+    def env(self, token=None):
+        env = base_env()
+        settings = [
+            ("credential.helper", ""),
+            ("core.hooksPath", "/dev/null"),
+            ("core.symlinks", "false"),
+            # Never send the header on to another host.
+            ("http.followRedirects", "false"),
+        ]
+        if token is not None:
+            settings.append(("http.extraHeader", "Authorization: Bearer " + token))
+        env.update(
+            {
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_CONFIG_COUNT": str(len(settings)),
+            }
+        )
+        for number, (key, value) in enumerate(settings):
+            env["GIT_CONFIG_KEY_%d" % number] = key
+            env["GIT_CONFIG_VALUE_%d" % number] = value
+        return env
+
+    def _run(self, step, args, token, cap):
+        """Run git to its end or to the time allowed; return (status, out, err).
+
+        git runs in a process group of its own. When time runs out the whole
+        group is killed, so a transport helper git started cannot keep the
+        pipes open and hold this run past its deadline.
+        """
+        timeout = self.deadline.allow(step, cap)
+        try:
+            process = subprocess.Popen(
+                [self.program, *args],
+                env=self.env(token),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+        except OSError as err:
+            raise Failure(step, "could not start git: %s" % why(err)) from None
+        RUNNING.append(process)
+        try:
+            out, err = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_group(process)
+            process.communicate()
+            raise Failure(step, "git timed out after %d s" % timeout) from None
+        finally:
+            RUNNING.remove(process)
+        return process.returncode, out, err
+
+    def __call__(self, step, *args, token=None, cap=GIT_STEP_SECONDS):
+        """Run git; return its stdout, or raise Failure with scrubbed text."""
+        status, out, err = self._run(step, args, token, cap)
+        if status != 0:
+            detail = scrub(err, self.secrets)
+            raise Failure(step, detail or "git exit status %d" % status)
+        return out.strip()
+
+    def status(self, step, *args):
+        """Run git for a yes-or-no question; return its exit status."""
+        return self._run(step, args, None, GIT_STEP_SECONDS)[0]
+
+
+def main_is_absent(git, clone):
+    """True only when the clone verifiably has no local main branch.
+
+    "Cannot be read" is not "absent": a ref file that exists but is empty or
+    damaged must stop the run, because creating main over it would skip the
+    fast-forward check exactly when the local history is in doubt.
+    """
+    if os.path.lexists(os.path.join(clone, ".git", "refs", "heads", "main")):
+        return False
+    listed = git(
+        "refs", "-C", clone, "for-each-ref", "--format=%(refname)", "refs/heads"
+    )
+    return "refs/heads/main" not in listed.split()
+
+
+def sync(git, clone, remote, token):
+    """Fetch `remote` into `clone` and fast-forward main.
+
+    Returns (head commit, its commit time, whether main moved).
+    """
+    if not os.path.isdir(os.path.join(clone, ".git")):
+        git("clone", "init", "--quiet", "--initial-branch=main", clone)
+
+    # 0: the key is set. 1: it is not (a run that stopped between `init` and
+    # `remote add`). Anything else: the clone's configuration is unreadable.
+    known = git.status("clone", "-C", clone, "config", "--get", "remote.origin.url")
+    if known == 1:
+        git("clone", "-C", clone, "remote", "add", "origin", remote)
+    elif known != 0:
+        raise Failure("clone", "the clone's configuration cannot be read")
+    elif git("clone", "-C", clone, "config", "--get", "remote.origin.url") != remote:
+        # Same repo name at a different address: not ours to guess about.
+        raise Failure("remote", "the clone's origin is not the configured remote")
+
+    git(
+        "fetch",
+        "-C",
+        clone,
+        "fetch",
+        "--quiet",
+        "--prune",
+        "origin",
+        "+refs/heads/*:refs/remotes/origin/*",
+        token=token,
+        cap=FETCH_STEP_SECONDS,
+    )
+
+    theirs = "refs/remotes/origin/main"
+    if git.status("fetch", "-C", clone, "rev-parse", "--verify", "--quiet", theirs):
+        raise Failure("fetch", "the remote has no main branch")
+    remote_head = git("fetch", "-C", clone, "rev-parse", "--verify", theirs)
+
+    moved = False
+    if main_is_absent(git, clone):
+        git("checkout", "-C", clone, "checkout", "--quiet", "-B", "main", theirs)
+        moved = True
+    else:
+        try:
+            local_head = git(
+                "refs", "-C", clone, "rev-parse", "--verify", "refs/heads/main^{commit}"
+            )
+        except Failure:
+            raise Failure(
+                "refs", "the archived main cannot be read; nothing was changed"
+            ) from None
+        if local_head != remote_head:
+            ancestor = git.status(
+                "merge",
+                "-C",
+                clone,
+                "merge-base",
+                "--is-ancestor",
+                local_head,
+                remote_head,
+            )
+            if ancestor == 1:
+                # History was rewritten or the repo replaced. The archive is
+                # the copy that must survive that: change nothing.
+                raise Failure(
+                    "diverged",
+                    "the remote main does not contain the archived main; "
+                    "nothing was changed",
+                )
+            if ancestor != 0:
+                raise Failure("merge", "could not compare the two histories")
+            git("merge", "-C", clone, "checkout", "--quiet", "main")
+            git("merge", "-C", clone, "merge", "--quiet", "--ff-only", theirs)
+            moved = True
+
+    head = git("merge", "-C", clone, "rev-parse", "--verify", "refs/heads/main")
+    if head != remote_head:
+        raise Failure("merge", "main did not reach the fetched commit")
+    commit_time = int(git("merge", "-C", clone, "log", "-1", "--format=%ct", "main"))
+    return head, commit_time, moved
+
+
+# --- what the job remembers, and what it reports -----------------------------
+
+
+def read_state(path):
+    """Return the saved state, or an empty one if there is none to trust."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            saved = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(saved, dict) or not isinstance(saved.get("repo"), str):
+        return {}
+    state = {"repo": saved["repo"]}
+    for key in KEPT:
+        if isinstance(saved.get(key), int) and not isinstance(saved.get(key), bool):
+            state[key] = saved[key]
+    return state
+
+
+def write_state(path, state):
+    """Replace the state file whole: a temp file, flushed, then a rename."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    temp = path + ".tmp"
+    with open(temp, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, path)
+
+
+def render(repo, values):
+    """Metric file text. Metrics with no value yet are left out."""
+    lines = []
+    for name, key, help_text in METRICS:
+        if key in values:
+            lines.append("# HELP %s %s" % (name, help_text))
+            lines.append("# TYPE %s gauge" % name)
+            lines.append('%s{repo="%s"} %d' % (name, repo, values[key]))
+    return "\n".join(lines) + "\n"
+
+
+def write_metrics(path, text):
+    """Rewrite the metric file without ever leaving it empty.
+
+    The service may be allowed to write this one file but not the directory
+    around it, so there is no rename. The new text goes over the old in a
+    single write and only then is the file cut to length; a run stopped in
+    between leaves the new text followed by the tail of the old, never
+    nothing. The state the job depends on is not here: it is in the state
+    file.
+    """
+    data = text.encode("utf-8")
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
+    try:
+        written = os.write(descriptor, data)
+        if written != len(data):
+            raise OSError(errno.EIO, "the metric file was only partly written")
+        os.ftruncate(descriptor, len(data))
+    finally:
+        os.close(descriptor)
+
+
+def record(state_path, metrics_path, repo, values):
+    """Save the state and rewrite the metrics. Returns the lines to print.
+
+    An empty list means everything wanted was written. `metrics_path` is None
+    when no metric file is configured.
+    """
+    problems = []
+    try:
+        saved = {key: values[key] for key in KEPT if key in values}
+        saved["repo"] = repo
+        write_state(state_path, saved)
+    except OSError as err:
+        problems.append(
+            "memory-archive: failed step=state repo=%s %s" % (repo, why(err))
+        )
+        # The archive may be current, but the next run could not know it.
+        values["last_run_ok"] = 0
+    if metrics_path:
+        try:
+            write_metrics(metrics_path, render(repo, values))
+        except OSError as err:
+            problems.append(
+                "memory-archive: failed step=metrics repo=%s %s" % (repo, why(err))
+            )
+    return problems
+
+
+def main():
+    remote = os.environ.get("MEMORY_ARCHIVE_REMOTE", "")
+    if not remote:
+        print("memory-archive: not configured: MEMORY_ARCHIVE_REMOTE is not set")
+        return 2
+    if (
+        "MEMORY_ARCHIVE_TOKEN" not in os.environ
+        and "CREDENTIALS_DIRECTORY" not in os.environ
+    ):
+        print(
+            "memory-archive: not configured: set MEMORY_ARCHIVE_TOKEN, or run "
+            "under systemd with the token loaded as a credential"
+        )
+        return 2
+    root = os.environ.get("MEMORY_ARCHIVE_ROOT") or DEFAULT_ROOT
+    metrics_path = os.environ.get("MEMORY_ARCHIVE_METRICS") or None
+    git_program = os.environ.get("MEMORY_ARCHIVE_GIT", "git")
+    try:
+        budget = float(
+            os.environ.get("MEMORY_ARCHIVE_DEADLINE_SECONDS", DEFAULT_DEADLINE_SECONDS)
+        )
+    except ValueError:
+        budget = math.nan
+    if not math.isfinite(budget) or budget <= 0:
+        print(
+            "memory-archive: not configured: MEMORY_ARCHIVE_DEADLINE_SECONDS "
+            "must be a number of seconds above zero"
+        )
+        return 2
+    deadline = Deadline(budget)
+
+    now = int(time.time())
+    state_path = os.path.join(root, STATE_DIR, STATE_FILE)
+    state = read_state(state_path)
+    values = {"last_run": now, "last_run_ok": 0, "last_success": 0}
+    values.update({key: state[key] for key in KEPT if key in state})
+    # What a run that never finishes is recorded as: a failure, with
+    # everything that was known before it started.
+    at_start = dict(values)
+    run = {"repo": state.get("repo", "unknown")}
+
+    # The backstop. Whichever of the two (this thread finishing, or the
+    # watchdog) takes the lock first does the recording; the other stands
+    # down.
+    finishing = threading.Lock()
+    grace = max(BACKSTOP_GRACE_MINIMUM, budget / BACKSTOP_GRACE_FRACTION)
+
+    def backstop():
+        if not finishing.acquire(blocking=False):
+            return
+        for process in list(RUNNING):
+            kill_group(process)
+        print(
+            "memory-archive: failed step=deadline repo=%s the run did not finish "
+            "in %d s and was stopped" % (run["repo"], budget + grace)
+        )
+        for problem in record(state_path, metrics_path, run["repo"], at_start):
+            print(problem)
+        sys.stdout.flush()
+        os._exit(1)
+
+    watchdog = threading.Timer(budget + grace, backstop)
+    watchdog.daemon = True
+    watchdog.start()
+
+    secrets = [remote]
+    failure = None
+    line = ""
+    try:
+        name = check_remote(remote)
+        if name != run["repo"]:
+            # Another repo than last time: its record starts fresh here.
+            values["last_success"] = 0
+            values.pop("head_commit_time", None)
+            values.pop("token_expiry", None)
+            at_start.clear()
+            at_start.update(values)
+        run["repo"] = name
+
+        token = read_token(os.environ)
+        secrets.extend([token, token.split("?", 1)[0]])
+
+        expiry = parse_expiry(token)
+        if expiry is None:
+            # Without it the expiry notices could never fire. Fail closed.
+            raise Failure("token", "the token carries no ?expires= time")
+        values["token_expiry"] = expiry
+        at_start["token_expiry"] = expiry
+
+        head, commit_time, moved = sync(
+            Git(git_program, secrets, deadline),
+            os.path.join(root, name),
+            remote,
+            token,
+        )
+        values["head_commit_time"] = commit_time
+        values["last_success"] = now
+        values["last_run_ok"] = 1
+        line = "memory-archive: ok repo=%s head=%s changed=%s" % (
+            name,
+            head[:12],
+            "yes" if moved else "no",
+        )
+    except Failure as err:
+        failure = err
+        line = "memory-archive: failed step=%s repo=%s %s" % (
+            err.step,
+            run["repo"],
+            scrub(err.message, secrets),
+        )
+
+    # If the watchdog got here first it is recording and about to exit.
+    finishing.acquire()
+    watchdog.cancel()
+    print(line)
+    problems = record(state_path, metrics_path, run["repo"], values)
+    for problem in problems:
+        print(problem)
+    return 1 if failure or problems else 0
+
+
+def parse_args(argv):
+    """The program takes no arguments; this gives it --help."""
+    parser = argparse.ArgumentParser(
+        prog="memory-archive",
+        description="Keep a full local copy of the memory-mcp notes repo up to "
+        "date. One run: fetch, then fast-forward main.",
+        epilog=HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.parse_args(argv)
+
+
+if __name__ == "__main__":
+    parse_args(sys.argv[1:])
+    sys.exit(main())

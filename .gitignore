@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+.env
+worker-configuration.d.ts
+*.log
+timing-runs/
+deploy/*
+!deploy/example.json
+wrangler.*.jsonc

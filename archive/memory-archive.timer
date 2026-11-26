@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2026 Curtis Galloway
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=Run the memory-mcp archive fetch every 15 minutes
+
+[Timer]
+# :00, :15, :30, :45. No random delay and one-second accuracy, so the gap
+# between runs does not stretch past the period.
+OnCalendar=*:0/15
+AccuracySec=1s
+# A run missed while the machine was off is made up at boot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

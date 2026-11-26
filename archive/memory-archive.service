@@ -1,0 +1,54 @@
+# SPDX-FileCopyrightText: 2026 Curtis Galloway
+# SPDX-License-Identifier: Apache-2.0
+#
+# One run of the memory-mcp archive job. Setup and runbook: README.md beside
+# this file.
+[Unit]
+Description=Fetch the memory-mcp notes repo into a local archive clone
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=memory-archive
+Group=memory-archive
+
+# The repo token is root-only on disk (/etc/memory-archive/token). systemd
+# reads it as root and hands the job a copy on a memory-backed filesystem
+# ($CREDENTIALS_DIRECTORY/memory-archive-token), so the job itself never runs
+# as root, the copy never reaches a disk, and the token is not in the job's
+# environment or on any command line.
+LoadCredential=memory-archive-token:/etc/memory-archive/token
+
+# The repo's https URL (no credentials in it) is not a secret. It lives in
+# /etc/memory-archive/config as one line: MEMORY_ARCHIVE_REMOTE=https://...
+# To write a metric file as well, add MEMORY_ARCHIVE_METRICS=<path> there and
+# allow the path in a drop-in (README, "Metrics").
+EnvironmentFile=/etc/memory-archive/config
+Environment=MEMORY_ARCHIVE_ROOT=/var/lib/memory-archive
+Environment=HOME=/var/lib/memory-archive
+ExecStart=/usr/local/bin/memory-archive
+# The job gives itself 240 s for everything (the fetch, the merge) and its own
+# watchdog records a failure and exits at 270 s, so this limit is only
+# reached if the job cannot run at all.
+TimeoutStartSec=300
+
+# /var/lib/memory-archive, created 0700 and owned by the job's user.
+StateDirectory=memory-archive
+StateDirectoryMode=0700
+
+# The whole filesystem is read-only to the job except its state directory
+# (the clone, and .state/state.json where it keeps the last success time).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+CapabilityBoundingSet=

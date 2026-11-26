@@ -1,0 +1,26 @@
+// SPDX-FileCopyrightText: 2026 Curtis Galloway
+// SPDX-License-Identifier: Apache-2.0
+//
+// This file is local development and tests only; it is never deployed as-is.
+// A deployment is described by deploy/<env>.json (see deploy/example.json), and
+// `npm run deploy -- <env>` generates wrangler.<env>.jsonc from it, taking
+// main, compatibility_date and compatibility_flags from here.
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "memory-mcp-dev",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-11-18",
+	// global_fetch_strictly_public is required by the OAuth provider for
+	// Client ID Metadata Documents (it fetches client-supplied URLs).
+	"compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+	"artifacts": [{ "binding": "ARTIFACTS", "namespace": "default", "remote": false }],
+	"durable_objects": { "bindings": [{ "name": "MEMORY_STORE", "class_name": "MemoryStore" }] },
+	"migrations": [{ "tag": "v1", "new_sqlite_classes": ["MemoryStore"] }],
+	"kv_namespaces": [{ "binding": "OAUTH_KV", "id": "local-only" }],
+	"vars": {
+		"MEMORY_REPO": "memory-dev",
+		"MCP_RESOURCE": "http://localhost:8787/mcp",
+		"ALLOWED_GITHUB_ID": "1000001",
+		"GITHUB_CLIENT_ID": "local-dev"
+	}
+}
