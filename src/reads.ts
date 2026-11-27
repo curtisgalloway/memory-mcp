@@ -20,15 +20,46 @@ export interface ReadOptions {
 	/** Waits between the two attempts of a binding call; tests inject a no-op. */
 	sleep?: (ms: number) => Promise<void>;
 	/** Set to true when any binding call needed its retry; for the tool log. */
-	stats?: { retried: boolean };
+	stats?: ReadStats;
+	/**
+	 * Looks a note up in the index, which records the commit that last changed
+	 * each note. Without it a read of main cannot say who changed the note or when.
+	 */
+	indexed?: (path: string) => Promise<IndexedNote | null>;
+}
+
+/**
+ * What a read's index lookup came to, for the tool log: `hit` (the row matched
+ * the text read), `stale` (a row for other text), `missing` (no row), `bare` (a
+ * matching row with no author or date), or `error` (the lookup threw).
+ */
+export type IndexOutcome = "hit" | "stale" | "missing" | "bare" | "error";
+
+export interface ReadStats {
+	retried: boolean;
+	/** Unset when the index was not asked: a read that names a ref, or no lookup given. */
+	index?: IndexOutcome;
+	/** The thrown error's name and code when `index` is `error`; never its message. */
+	indexError?: string;
+}
+
+/** What the index holds about one note. */
+export interface IndexedNote {
+	/** The blob SHA the row was built from. */
+	version: string;
+	/** Null when the index was built without finding the note's commit. */
+	author: string | null;
+	/** Unix seconds; null as for `author`. */
+	updated_at: number | null;
 }
 
 export interface Note {
 	text: string;
 	/** The note's git blob SHA. */
 	version: string;
-	updated_at: string;
-	author: string;
+	/** When the note last changed, and who changed it; null when not known. */
+	updated_at: string | null;
+	author: string | null;
 }
 
 export interface HistoryEntry {
@@ -81,7 +112,7 @@ function defaultSleep(ms: number): Promise<void> {
 }
 
 /**
- * Confinement rules for reads; writes apply the fuller layout rules. Returns the rule a
+ * M1 confinement only; the full layout rules arrive in M2. Returns the rule a
  * path breaks, or null when it is acceptable.
  */
 export function checkPath(path: string): string | null {
@@ -168,20 +199,64 @@ export async function readNote(
 	const head = await withRetry(() => repo.log({ ref, limit: 1 }), opts);
 	if (head.length === 0) return notFound;
 	const commit = head[0];
-	const [file, version] = await Promise.all([
+	// The head of main is whichever note changed last, so it says nothing about
+	// this one. The index knows the commit that last changed each note, and asking
+	// it costs no history walk. A caller that names a commit gets that commit's
+	// own author and date: memory_history hands out the commits that changed the
+	// note, so for those the two agree.
+	const onMain = ref === DEFAULT_REF;
+	const [file, version, row] = await Promise.all([
 		withRetry(() => repo.readFile({ ref: commit.hash, path: args.path }), opts),
 		new TreeWalker(repo, opts).blobHash(commit.treeHash, args.path),
+		onMain ? indexedRow(args.path, opts) : null,
 	]);
 	if (!file || !version) return notFound;
+	const text = await file.text();
+	if (!onMain) {
+		return {
+			ok: true,
+			text,
+			version,
+			updated_at: new Date(commit.committedAt * 1000).toISOString(),
+			author: commit.author.name,
+		};
+	}
+	// A row built from other text describes another change to the note: the index
+	// is a push behind. Saying nothing is better than naming the wrong client.
+	const known = row !== null && row.version === version;
+	if (opts.stats && opts.indexed && opts.stats.index !== "error") {
+		if (row === null) opts.stats.index = "missing";
+		else if (!known) opts.stats.index = "stale";
+		else opts.stats.index = row.author === null || row.updated_at === null ? "bare" : "hit";
+	}
 	return {
 		ok: true,
-		text: await file.text(),
+		text,
 		version,
-		// This is the ref's head commit, not the newest commit that changed this
-		// note: finding that needs a history walk, too slow for a read.
-		updated_at: new Date(commit.committedAt * 1000).toISOString(),
-		author: commit.author.name,
+		updated_at:
+			known && row.updated_at !== null ? new Date(row.updated_at * 1000).toISOString() : null,
+		author: known ? row.author : null,
 	};
+}
+
+/** The note's index row, or null: the text is the answer, and the index only adds to it. */
+async function indexedRow(path: string, opts: ReadOptions): Promise<IndexedNote | null> {
+	if (!opts.indexed) return null;
+	try {
+		return await opts.indexed(path);
+	} catch (error) {
+		if (opts.stats) {
+			const code = (error as { code?: unknown } | null)?.code;
+			opts.stats.index = "error";
+			opts.stats.indexError = [
+				error instanceof Error ? error.name : typeof error,
+				typeof code === "string" ? code : "",
+			]
+				.filter(Boolean)
+				.join(":");
+		}
+		return null;
+	}
 }
 
 export async function noteHistory(

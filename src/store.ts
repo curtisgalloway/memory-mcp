@@ -30,7 +30,7 @@ import {
 	MAX_INDEXED_BLOB_BYTES,
 	parseNote,
 } from "./notes";
-import { withRetry } from "./reads";
+import { withRetry, type IndexedNote } from "./reads";
 import { changedPaths, listNotes, TreeCache } from "./tree";
 
 export interface DuplicateCandidate {
@@ -750,6 +750,19 @@ export class MemoryStore extends DurableObject<Env> {
 			})),
 			truncated: rows.length > MAX_LIST,
 		};
+	}
+
+	/** One note's index row, for memory_read: the blob it was built from, and who changed the note and when. */
+	async indexed(path: string): Promise<IndexedNote | null> {
+		await this.ensureIndexed();
+		const row = this.ctx.storage.sql
+			.exec<{ blob_sha: string; author: string | null; updated_at: number | null }>(
+				"SELECT blob_sha, author, updated_at FROM notes WHERE path = ?",
+				path,
+			)
+			.toArray()[0];
+		if (!row) return null;
+		return { version: row.blob_sha, author: row.author, updated_at: row.updated_at };
 	}
 
 	/** The start-of-conversation answer: profile and preferences in full, then a catalog. */

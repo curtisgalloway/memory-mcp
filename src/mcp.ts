@@ -16,6 +16,7 @@ import {
 	readNote,
 	type ReadFailure,
 	type ReadOptions,
+	type ReadStats,
 } from "./reads";
 import type { StoreResult } from "./store";
 
@@ -91,7 +92,7 @@ async function runTool(
 	body: (opts: ReadOptions) => Promise<ToolDone | ReadFailure>,
 ): Promise<ToolResult> {
 	const started = Date.now();
-	const stats = { retried: false };
+	const stats: ReadStats = { retried: false };
 	let outcome: Outcome;
 	let result: ToolResult;
 	try {
@@ -126,6 +127,9 @@ async function runTool(
 			ms,
 			outcome,
 			retried: stats.retried,
+			// memory_read only: what its index lookup came to, and the error's name if it threw.
+			index: stats.index,
+			index_error: stats.indexError,
 			// Only a well-formed note path is logged: a client that sends note text
 			// or a question as the path must not get that text into the logs.
 			path: checkPath(path) === null ? path : undefined,
@@ -316,8 +320,9 @@ export function createServer(): McpServer {
 		{
 			description:
 				"Read one note by its path, for example projects/alpha.md. Returns the note's text, " +
-				"its version (an identifier that changes whenever the text does), and who last " +
-				"committed. Pass ref only to read an older commit.",
+				"its version (an identifier that changes whenever the text does), and when the " +
+				"note last changed and which client changed it (null when not known). Pass ref " +
+				"only to read an older commit; the date and author are then that commit's.",
 			inputSchema: {
 				path: z.string().max(MAX_PATH).describe("Note path ending in .md, such as projects/alpha.md"),
 				ref: z.string().optional().describe("Branch or commit to read; defaults to main"),
@@ -326,7 +331,10 @@ export function createServer(): McpServer {
 		({ path, ref }) =>
 			runTool("memory_read", path, async (opts) => {
 				using repo = await env.ARTIFACTS.get(env.MEMORY_REPO);
-				const note = await readNote(repo, { path, ref }, opts);
+				// The text comes from the binding, so a read never waits behind a
+				// write. The store only answers from its index, outside its write queue.
+				const indexed = (p: string) => env.MEMORY_STORE.getByName("main").indexed(p);
+				const note = await readNote(repo, { path, ref }, { ...opts, indexed });
 				if (!note.ok) return note;
 				const { ok: _ok, ...value } = note;
 				return { ok: true, value };

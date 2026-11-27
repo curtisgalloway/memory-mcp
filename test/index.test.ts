@@ -176,13 +176,13 @@ describe("A1", () => {
 });
 
 describe("index schema", () => {
-	it("replaces the older notes table with the index and forgets the indexed commit", async () => {
+	it("replaces the M2 notes table with the M3 index and forgets the indexed commit", async () => {
 		const after = await runInDurableObject(
 			env.MEMORY_STORE.getByName("old-schema"),
 			(instance: MemoryStore) => {
 				const holder = instance as unknown as { ctx: DurableObjectState; env: Env };
 				const sql = holder.ctx.storage.sql;
-				// The state a store deployed before the index existed holds.
+				// The state a store deployed before M3 holds.
 				sql.exec("DROP TABLE notes_fts");
 				sql.exec("DROP TABLE notes");
 				sql.exec("CREATE TABLE notes (path TEXT PRIMARY KEY, blob_sha TEXT NOT NULL)");
@@ -297,6 +297,17 @@ describe("memory_list", () => {
 		const byPath = Object.fromEntries((await rows()).map((r) => [r.path, r.author]));
 		expect(byPath["food/coffee.md"]).toBe("seed-client");
 		expect(byPath["projects/kiln.md"]).toBe("second-author");
+	});
+});
+
+describe("memory_read", () => {
+	it("reports each note's own author and date, not the newest commit's", async () => {
+		// The second seeded commit, by another author, did not touch the coffee note.
+		const coffee = await callTool("memory_read", { path: "food/coffee.md" });
+		expect(coffee.isError, coffee.text).toBeFalsy();
+		expect(coffee.json).toMatchObject({ author: "seed-client", updated_at: iso(SEED_EPOCH) });
+		const kiln = await callTool("memory_read", { path: "projects/kiln.md" });
+		expect(kiln.json).toMatchObject({ author: "second-author", updated_at: iso(SEED_EPOCH + 1) });
 	});
 });
 
@@ -593,7 +604,7 @@ describe("reindex failures", () => {
 		await restoreRepo();
 	});
 
-	it("a note whose read fails keeps its row and the old mark; the next reindex picks it up", async () => {
+	it("F1: a note whose read fails keeps its row and the old mark; the next reindex picks it up", async () => {
 		const read = await callTool("memory_read", { path: "food/tea.md" });
 		const mark = await meta("indexed_commit");
 		await directPush("food/tea.md", "# Tea\n\nDarjeeling now, still no milk.\n", read.json.version);
@@ -622,7 +633,7 @@ describe("reindex failures", () => {
 		expect(await search("sourdough")).toEqual(["food/toast.md"]);
 	});
 
-	it("a tree that reads as missing fails the reindex, deleting nothing and leaving the mark", async () => {
+	it("F5: a tree that reads as missing fails the reindex, deleting nothing and leaving the mark", async () => {
 		await directPush("food/jam.md", "# Jam\n\nDamson.\n");
 		const before = { rows: await rows(), mark: await meta("indexed_commit") };
 		await faultRepo({ readTree: async () => null });
@@ -640,7 +651,7 @@ describe("reindex failures", () => {
 		expect(await store().reindex()).toMatchObject({ changed: 1, failed: 0 });
 	});
 
-	it("a full reindex that cannot read the repo leaves the old index answering", async () => {
+	it("F6: a full reindex that cannot read the repo leaves the old index answering", async () => {
 		const before = { rows: await rows(), mark: await meta("indexed_commit") };
 		await faultRepo({
 			readTree: async () => {
@@ -657,7 +668,7 @@ describe("reindex failures", () => {
 		expect(await search("espresso")).toEqual(["people/alex-smith.md"]);
 	});
 
-	it("a full reindex whose note reads fail keeps every row", async () => {
+	it("F6: a full reindex whose note reads fail keeps every row", async () => {
 		const before = { rows: await rows(), mark: await meta("indexed_commit") };
 		expect(before.rows.length).toBeGreaterThan(16);
 		await faultRepo({
@@ -738,7 +749,7 @@ describe("reindex failures", () => {
 		expect(await search("shawm")).toEqual(["people/unread.md"]);
 	});
 
-	it("the reindex after the store's own push does not undo it when main reads as behind; the event repairs it", async () => {
+	it("F2: the reindex after the store's own push does not undo it when main reads as behind; the event repairs it", async () => {
 		await directPush("people/beneath.md", "# Beneath\n\nPushed first: sousaphone.\n");
 		const mark = await meta("indexed_commit");
 		// The binding answers as if the newest commit had not landed yet.
@@ -768,7 +779,7 @@ describe("reindex failures", () => {
 		expect(await search("flugelhorn")).toEqual(["people/above.md"]);
 	});
 
-	it("an own push whose following reindex failed is repaired by its own event", async () => {
+	it("F9: an own push whose following reindex failed is repaired by its own event", async () => {
 		await directPush("people/missed.md", "# Missed\n\nPushed first: euphonium.\n");
 		const mark = await meta("indexed_commit");
 		await faultRepo({
